@@ -1705,8 +1705,8 @@ class PMMInSitu:
         warmup=5.0,
         cooldown=3.0,
         ideal_W=40.0,
-        low_W=30.0,
-        high_W=50.0
+        low_W=39.0,
+        high_W=41.0
     ):
         """
         Active bulb-health diagnostic.
