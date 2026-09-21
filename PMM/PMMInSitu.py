@@ -837,7 +837,8 @@ def save_demult_progress_callback(
     active_health_V=20.0,
     active_health_I=3.0,
     active_health_warmup=5.0,
-    active_health_cooldown=3.0
+    active_health_cooldown=3.0,
+    active_health_stop_W=None
 ):
     """
     Save each new six-port Bayesian demultiplexer evaluation
@@ -1085,16 +1086,16 @@ def save_demult_progress_callback(
             )
 
             try:
-                pmm_instance.Run_Array_Health_Diagnostic(
+                rows = pmm_instance.Run_Array_Health_Diagnostic(
                     save_path=health_path,
                     call_idx=call_idx,
                     V_diag=active_health_V,
                     I_diag=active_health_I,
                     warmup=active_health_warmup,
                     cooldown=active_health_cooldown,
-                    ideal_W=40.0,
-                    low_W=30.0,
-                    high_W=50.0
+                    ideal_W=20.0,
+                    low_W=1.0,
+                    high_W=active_health_stop_W if active_health_stop_W is not None else 50.0
                 )
 
                 pmm_instance.Plot_Health_History(
@@ -1104,10 +1105,17 @@ def save_demult_progress_callback(
                 )
 
             except Exception as exc:
-                print(
-                    f"[WARN] Active health diagnostic failed "
-                    f"at call {call_idx}: {exc}"
-                )
+                print(f"[WARN] Active health diagnostic failed at call {call_idx}: {exc}")
+                rows = []
+
+            if active_health_stop_W is not None:
+                high_power = [row for row in rows if np.isfinite(row["P_power_supply"]) and row["P_power_supply"] > active_health_stop_W]
+
+                if high_power:
+                    print("\n!!! HIGH POWER SAFETY STOP !!!")
+                    for row in high_power:
+                        print(f"Bulb {row['addr']} is drawing {row['P_power_supply']:.2f} W (> {active_health_stop_W:.2f} W)")
+                    raise RuntimeError("HIGH POWER SAFETY STOP: one or more bulbs exceeded the allowed power.")
 
     return _callback
 
@@ -3113,6 +3121,7 @@ class PMMInSitu:
         active_health_I=3.0,
         active_health_warmup=5.0,
         active_health_cooldown=3.0,
+        active_health_stop_W=None,
         active_health_log_path=None,
         health_monitor_interval=1.0,
     ):
@@ -3428,7 +3437,8 @@ class PMMInSitu:
                 active_health_V=active_health_V,
                 active_health_I=active_health_I,
                 active_health_warmup=active_health_warmup,
-                active_health_cooldown=active_health_cooldown
+                active_health_cooldown=active_health_cooldown,
+                active_health_stop_W=active_health_stop_W
             )
         )
 
