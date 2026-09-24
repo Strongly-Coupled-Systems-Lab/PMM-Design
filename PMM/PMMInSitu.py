@@ -318,10 +318,7 @@ def Demult_Obj_dB_Flexible(
         correct_metrics.append(correct_dB)
         isolation_metrics.append(isolation_dB)
 
-    current_metrics = (
-        correct_metrics
-        + isolation_metrics
-    )
+    current_metrics = correct_metrics + isolation_metrics
 
     if len(norms) == 0:
         return 0.0, current_metrics
@@ -329,25 +326,41 @@ def Demult_Obj_dB_Flexible(
     if len(norms) != len(current_metrics):
         raise ValueError(
             "Norms length does not match the current demux target setup. "
-            "If you changed target_ports or wrong_port_weights, use a new ID "
-            "so the run creates fresh norms."
+            "Use a new ID after changing the objective."
         )
 
-    n_targets = len(clean_targets)
+    # Require BOTH demux channels to reach this isolation.
+    iso_target = 20.0
 
-    transmission_gain = sum(
-        current_metrics[i] - norms[i]
-        for i in range(n_targets)
-    )
+    # If either channel is bad, the whole demux is bad.
+    worst_iso = float(np.min(isolation_metrics))
 
-    isolation_gain = sum(
-        current_metrics[n_targets + i] - norms[n_targets + i]
-        for i in range(n_targets)
-    )
+    # Once routing is good, improve the weaker desired transmission.
+    worst_correct_dB = float(np.min(correct_metrics))
 
-    objective_value = (
-        w_trans * transmission_gain
-        + w_iso * isolation_gain
+    if worst_iso < iso_target:
+        # Before both channels reach 20 dB isolation,
+        # optimize ONLY the weaker demultiplexing channel.
+        objective_value = w_iso * worst_iso
+
+    else:
+        # Once BOTH channels reach >=20 dB isolation,
+        # stop rewarding extra isolation and improve transmission.
+        transmission_score = 0.1 * (
+            np.clip(worst_correct_dB, -80.0, 0.0) + 80.0
+        )
+
+        objective_value = (
+            w_iso * iso_target
+            + w_trans * transmission_score
+        )
+
+    print(
+        f"[Demux objective] "
+        f"trans={np.round(correct_metrics, 2)}, "
+        f"iso={np.round(isolation_metrics, 2)}, "
+        f"worst_iso={worst_iso:.2f} dB, "
+        f"obj={objective_value:.2f}"
     )
 
     return float(objective_value), norms
