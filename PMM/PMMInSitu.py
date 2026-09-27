@@ -329,31 +329,21 @@ def Demult_Obj_dB_Flexible(
             "Use a new ID after changing the objective."
         )
 
-    # Require BOTH demux channels to reach this isolation.
-    iso_target = 20.0
-
-    # If either channel is bad, the whole demux is bad.
+    # Strongly favor the weaker demux channel, while still rewarding improvement in both channels.
     worst_iso = float(np.min(isolation_metrics))
+    mean_iso = float(np.mean(isolation_metrics))
 
-    # Once routing is good, improve the weaker desired transmission.
+    # Reward transmission through the weaker desired channel.
     worst_correct_dB = float(np.min(correct_metrics))
 
-    if worst_iso < iso_target:
-        # Before both channels reach 20 dB isolation,
-        # optimize ONLY the weaker demultiplexing channel.
-        objective_value = w_iso * worst_iso
+    transmission_score = 0.1 * (
+        np.clip(worst_correct_dB, -80.0, 0.0) + 80.0
+    )
 
-    else:
-        # Once BOTH channels reach >=20 dB isolation,
-        # stop rewarding extra isolation and improve transmission.
-        transmission_score = 0.1 * (
-            np.clip(worst_correct_dB, -80.0, 0.0) + 80.0
-        )
-
-        objective_value = (
-            w_iso * iso_target
-            + w_trans * transmission_score
-        )
+    objective_value = (
+        w_iso * (0.7 * worst_iso + 0.3 * mean_iso)
+        + w_trans * transmission_score
+    )
 
     print(
         f"[Demux objective] "
