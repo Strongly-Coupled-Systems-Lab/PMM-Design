@@ -193,12 +193,20 @@ def Demult_Obj_dB_Flexible(
     wrong_port_weights=None
 ):
     """
-    Flexible multi-port dB demultiplexer objective.
+    Multi-port demultiplexer objective.
 
-    targets example:
-        [(4.0, "S21"), (6.0, "S31")]
+    Primary goal:
+        At each target frequency, the desired target port must beat
+        the other target port(s).
 
-    wrong_port_weights controls how strongly each wrong port is penalized.
+    Secondary goals:
+        - Keep useful transmission through the desired ports.
+        - Penalize leakage into non-target ports if it exceeds the
+          desired-port transmission.
+
+    Example:
+        4 GHz -> S21
+        6 GHz -> S31
     """
 
     if norms is None:
@@ -253,13 +261,22 @@ def Demult_Obj_dB_Flexible(
             "targets must contain at least one (frequency, port) pair."
         )
 
+    target_ports = [port for _, port in clean_targets]
+    target_port_set = set(target_ports)
+
+    if len(target_port_set) < 2:
+        raise ValueError(
+            "Demultiplexer objective requires at least two target ports."
+        )
+
     T = {
         port: 10.0**(clean_traces[port] / 10.0)
         for port in port_labels
     }
 
     correct_metrics = []
-    isolation_metrics = []
+    pairwise_metrics = []
+    extra_leakage_metrics = []
 
     for target_freq, desired_port in clean_targets:
         i_l = np.searchsorted(
@@ -279,17 +296,46 @@ def Demult_Obj_dB_Flexible(
                 f"No VNA points were found near {target_freq} GHz."
             )
 
+        # Desired-port transmission.
         correct_dB = float(
             np.mean(clean_traces[desired_port][i_l:i_r])
         )
 
-        bad_power = np.zeros_like(
-            freq,
-            dtype=float
+        # ============================================================
+        # PRIMARY DEMUX METRIC
+        # Compare desired port against the other target port(s).
+        # For our case:
+        #   4 GHz -> S21 - S31
+        #   6 GHz -> S31 - S21
+        # ============================================================
+
+        competing_power = np.zeros_like(freq, dtype=float)
+
+        for port in target_port_set:
+            if port != desired_port:
+                competing_power += T[port]
+
+        competing_dB = 10.0 * np.log10(
+            competing_power + 1e-300
         )
 
+        pairwise_sep_dB = float(
+            np.mean(
+                clean_traces[desired_port][i_l:i_r]
+                - competing_dB[i_l:i_r]
+            )
+        )
+
+        # ============================================================
+        # SECONDARY LEAKAGE METRIC
+        # Look only at ports that are NOT target demux ports.
+        # For S21/S31 demux this means S41, S51, S61.
+        # ============================================================
+
+        extra_power = np.zeros_like(freq, dtype=float)
+
         for port in port_labels:
-            if port == desired_port:
+            if port in target_port_set:
                 continue
 
             weight = float(
@@ -299,26 +345,27 @@ def Demult_Obj_dB_Flexible(
             if weight == 0.0:
                 continue
 
-            bad_power = bad_power + weight * T[port]
+            extra_power += weight * T[port]
 
-        if np.all(bad_power == 0.0):
-            isolation_dB = 0.0
+        if np.all(extra_power == 0.0):
+            extra_sep_dB = 0.0
         else:
-            bad_dB = 10.0 * np.log10(
-                bad_power + 1e-300
+            extra_dB = 10.0 * np.log10(
+                extra_power + 1e-300
             )
 
-            isolation_dB = float(
+            extra_sep_dB = float(
                 np.mean(
                     clean_traces[desired_port][i_l:i_r]
-                    - bad_dB[i_l:i_r]
+                    - extra_dB[i_l:i_r]
                 )
             )
 
         correct_metrics.append(correct_dB)
-        isolation_metrics.append(isolation_dB)
+        pairwise_metrics.append(pairwise_sep_dB)
+        extra_leakage_metrics.append(extra_sep_dB)
 
-    current_metrics = correct_metrics + isolation_metrics
+    current_metrics = correct_metrics + pairwise_metrics
 
     if len(norms) == 0:
         return 0.0, current_metrics
@@ -329,27 +376,49 @@ def Demult_Obj_dB_Flexible(
             "Use a new ID after changing the objective."
         )
 
-    # Strongly favor the weaker demux channel, while still rewarding improvement in both channels.
-    worst_iso = float(np.min(isolation_metrics))
-    mean_iso = float(np.mean(isolation_metrics))
+    # ================================================================
+    # SCORE
+    #
+    # The worse target frequency matters most, so BOTH frequencies
+    # must demultiplex correctly.
+    # ================================================================
 
-    # Reward transmission through the weaker desired channel.
+    worst_pairwise = float(np.min(pairwise_metrics))
+    mean_pairwise = float(np.mean(pairwise_metrics))
+
+    pairwise_score = (
+        0.7 * worst_pairwise
+        + 0.3 * mean_pairwise
+    )
+
+    # Small reward for keeping the weaker desired transmission useful.
     worst_correct_dB = float(np.min(correct_metrics))
 
     transmission_score = 0.1 * (
         np.clip(worst_correct_dB, -80.0, 0.0) + 80.0
     )
 
+    # Extra ports are only a secondary penalty.
+    # They cannot earn extra reward for beating down S41/S51/S61.
+    mean_extra_sep = float(np.mean(extra_leakage_metrics))
+
+    extra_leakage_penalty = max(
+        0.0,
+        -mean_extra_sep
+    )
+
     objective_value = (
-        w_iso * (0.7 * worst_iso + 0.3 * mean_iso)
+        w_iso * pairwise_score
         + w_trans * transmission_score
+        - 0.1 * extra_leakage_penalty
     )
 
     print(
         f"[Demux objective] "
         f"trans={np.round(correct_metrics, 2)}, "
-        f"iso={np.round(isolation_metrics, 2)}, "
-        f"worst_iso={worst_iso:.2f} dB, "
+        f"pair_sep={np.round(pairwise_metrics, 2)}, "
+        f"extra_sep={np.round(extra_leakage_metrics, 2)}, "
+        f"worst_pair={worst_pairwise:.2f} dB, "
         f"obj={objective_value:.2f}"
     )
 
