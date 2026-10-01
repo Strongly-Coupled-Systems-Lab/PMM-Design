@@ -182,27 +182,273 @@ def _coerce_sparam_label(label):
     return label
 
 
+# def Demult_Obj_dB_Flexible(
+#     freq,
+#     traces,
+#     targets,
+#     df=0.25,
+#     norms=None,
+#     w_trans=0.25,
+#     w_iso=1.0,
+#     wrong_port_weights=None
+# ):
+#     """
+#     Multi-port demultiplexer objective.
+
+#     Primary goal:
+#         At each target frequency, the desired target port must beat
+#         the other target port(s).
+
+#     Secondary goals:
+#         - Keep useful transmission through the desired ports.
+#         - Penalize leakage into non-target ports if it exceeds the
+#           desired-port transmission.
+
+#     Example:
+#         4 GHz -> S21
+#         6 GHz -> S31
+#     """
+
+#     if norms is None:
+#         norms = []
+
+#     freq = np.asarray(freq, dtype=float)
+
+#     port_labels = ["S21", "S31", "S41", "S51", "S61"]
+
+#     clean_traces = {}
+#     for port, trace in traces.items():
+#         clean_port = _coerce_sparam_label(port)
+#         clean_traces[clean_port] = np.asarray(trace, dtype=float)
+
+#     missing = [
+#         port
+#         for port in port_labels
+#         if port not in clean_traces
+#     ]
+
+#     if missing:
+#         raise ValueError(
+#             f"Missing traces for ports: {missing}"
+#         )
+
+#     if any(clean_traces[port].shape != freq.shape for port in port_labels):
+#         raise ValueError(
+#             "All traces must have the same shape as freq."
+#         )
+
+#     if wrong_port_weights is None:
+#         wrong_port_weights = {
+#             port: 1.0
+#             for port in port_labels
+#         }
+#     else:
+#         wrong_port_weights = {
+#             _coerce_sparam_label(port): float(weight)
+#             for port, weight in wrong_port_weights.items()
+#         }
+
+#         for port in port_labels:
+#             wrong_port_weights.setdefault(port, 1.0)
+
+#     clean_targets = [
+#         (float(target_freq), _coerce_sparam_label(target_port))
+#         for target_freq, target_port in targets
+#     ]
+
+#     if len(clean_targets) == 0:
+#         raise ValueError(
+#             "targets must contain at least one (frequency, port) pair."
+#         )
+
+#     target_ports = [port for _, port in clean_targets]
+#     target_port_set = set(target_ports)
+
+#     if len(target_port_set) < 2:
+#         raise ValueError(
+#             "Demultiplexer objective requires at least two target ports."
+#         )
+
+#     T = {
+#         port: 10.0**(clean_traces[port] / 10.0)
+#         for port in port_labels
+#     }
+
+#     correct_metrics = []
+#     pairwise_metrics = []
+#     extra_leakage_metrics = []
+
+#     for target_freq, desired_port in clean_targets:
+#         i_l = np.searchsorted(
+#             freq,
+#             target_freq - df / 2,
+#             side="left"
+#         )
+
+#         i_r = np.searchsorted(
+#             freq,
+#             target_freq + df / 2,
+#             side="right"
+#         )
+
+#         if i_l >= i_r:
+#             raise ValueError(
+#                 f"No VNA points were found near {target_freq} GHz."
+#             )
+
+#         # Desired-port transmission.
+#         correct_dB = float(
+#             np.mean(clean_traces[desired_port][i_l:i_r])
+#         )
+
+#         # ============================================================
+#         # PRIMARY DEMUX METRIC
+#         # Compare desired port against the other target port(s).
+#         # For our case:
+#         #   4 GHz -> S21 - S31
+#         #   6 GHz -> S31 - S21
+#         # ============================================================
+
+#         competing_power = np.zeros_like(freq, dtype=float)
+
+#         for port in target_port_set:
+#             if port != desired_port:
+#                 competing_power += T[port]
+
+#         competing_dB = 10.0 * np.log10(
+#             competing_power + 1e-300
+#         )
+
+#         pairwise_sep_dB = float(
+#             np.mean(
+#                 clean_traces[desired_port][i_l:i_r]
+#                 - competing_dB[i_l:i_r]
+#             )
+#         )
+
+#         # ============================================================
+#         # SECONDARY LEAKAGE METRIC
+#         # Look only at ports that are NOT target demux ports.
+#         # For S21/S31 demux this means S41, S51, S61.
+#         # ============================================================
+
+#         extra_power = np.zeros_like(freq, dtype=float)
+
+#         for port in port_labels:
+#             if port in target_port_set:
+#                 continue
+
+#             weight = float(
+#                 wrong_port_weights.get(port, 1.0)
+#             )
+
+#             if weight == 0.0:
+#                 continue
+
+#             extra_power += weight * T[port]
+
+#         if np.all(extra_power == 0.0):
+#             extra_sep_dB = 0.0
+#         else:
+#             extra_dB = 10.0 * np.log10(
+#                 extra_power + 1e-300
+#             )
+
+#             extra_sep_dB = float(
+#                 np.mean(
+#                     clean_traces[desired_port][i_l:i_r]
+#                     - extra_dB[i_l:i_r]
+#                 )
+#             )
+
+#         correct_metrics.append(correct_dB)
+#         pairwise_metrics.append(pairwise_sep_dB)
+#         extra_leakage_metrics.append(extra_sep_dB)
+
+#     current_metrics = correct_metrics + pairwise_metrics
+
+#     if len(norms) == 0:
+#         return 0.0, current_metrics
+
+#     if len(norms) != len(current_metrics):
+#         raise ValueError(
+#             "Norms length does not match the current demux target setup. "
+#             "Use a new ID after changing the objective."
+#         )
+
+#     # ================================================================
+#     # SCORE
+#     #
+#     # The worse target frequency matters most, so BOTH frequencies
+#     # must demultiplex correctly.
+#     # ================================================================
+
+#     worst_pairwise = float(np.min(pairwise_metrics))
+#     mean_pairwise = float(np.mean(pairwise_metrics))
+
+#     pairwise_score = (
+#         0.7 * worst_pairwise
+#         + 0.3 * mean_pairwise
+#     )
+
+#     # Small reward for keeping the weaker desired transmission useful.
+#     worst_correct_dB = float(np.min(correct_metrics))
+
+#     transmission_score = 0.1 * (
+#         np.clip(worst_correct_dB, -80.0, 0.0) + 80.0
+#     )
+
+#     # Extra ports are only a secondary penalty.
+#     # They cannot earn extra reward for beating down S41/S51/S61.
+#     mean_extra_sep = float(np.mean(extra_leakage_metrics))
+
+#     extra_leakage_penalty = max(
+#         0.0,
+#         -mean_extra_sep
+#     )
+
+#     objective_value = (
+#         w_iso * pairwise_score
+#         + w_trans * transmission_score
+#         - 0.1 * extra_leakage_penalty
+#     )
+
+#     print(
+#         f"[Demux objective] "
+#         f"trans={np.round(correct_metrics, 2)}, "
+#         f"pair_sep={np.round(pairwise_metrics, 2)}, "
+#         f"extra_sep={np.round(extra_leakage_metrics, 2)}, "
+#         f"worst_pair={worst_pairwise:.2f} dB, "
+#         f"obj={objective_value:.2f}"
+#     )
+
+#     return float(objective_value), norms
+
 def Demult_Obj_dB_Flexible(
     freq,
     traces,
     targets,
     df=0.25,
     norms=None,
-    w_trans=0.25,
+    w_trans=1.0,
     w_iso=1.0,
     wrong_port_weights=None
 ):
     """
-    Multi-port demultiplexer objective.
+    Demultiplexer objective.
 
-    Primary goal:
-        At each target frequency, the desired target port must beat
-        the other target port(s).
+    Reward:
+        Product of desired-port transmission at all target frequencies,
+        so every frequency must perform well.
 
-    Secondary goals:
-        - Keep useful transmission through the desired ports.
-        - Penalize leakage into non-target ports if it exceeds the
-          desired-port transmission.
+    Penalties:
+        Wrong target-port power is penalized separately at each frequency.
+        Leakage into non-target ports is a smaller secondary penalty.
+
+    Normalization:
+        All terms at each frequency are normalized by the initial
+        desired-port transmission at that frequency. This avoids huge
+        penalties caused by dividing by an initially tiny leakage value.
 
     Example:
         4 GHz -> S21
@@ -232,7 +478,10 @@ def Demult_Obj_dB_Flexible(
             f"Missing traces for ports: {missing}"
         )
 
-    if any(clean_traces[port].shape != freq.shape for port in port_labels):
+    if any(
+        clean_traces[port].shape != freq.shape
+        for port in port_labels
+    ):
         raise ValueError(
             "All traces must have the same shape as freq."
         )
@@ -252,33 +501,36 @@ def Demult_Obj_dB_Flexible(
             wrong_port_weights.setdefault(port, 1.0)
 
     clean_targets = [
-        (float(target_freq), _coerce_sparam_label(target_port))
+        (
+            float(target_freq),
+            _coerce_sparam_label(target_port)
+        )
         for target_freq, target_port in targets
     ]
 
-    if len(clean_targets) == 0:
+    if len(clean_targets) < 2:
         raise ValueError(
-            "targets must contain at least one (frequency, port) pair."
+            "Demultiplexer objective requires at least two target frequencies."
         )
 
-    target_ports = [port for _, port in clean_targets]
-    target_port_set = set(target_ports)
+    target_port_set = {
+        port
+        for _, port in clean_targets
+    }
 
-    if len(target_port_set) < 2:
-        raise ValueError(
-            "Demultiplexer objective requires at least two target ports."
-        )
-
+    # Convert dB transmission to linear power.
     T = {
         port: 10.0**(clean_traces[port] / 10.0)
         for port in port_labels
     }
 
     correct_metrics = []
-    pairwise_metrics = []
-    extra_leakage_metrics = []
+    wrong_metrics = []
+    extra_metrics = []
+    pairwise_sep_dB = []
 
     for target_freq, desired_port in clean_targets:
+
         i_l = np.searchsorted(
             freq,
             target_freq - df / 2,
@@ -296,43 +548,51 @@ def Demult_Obj_dB_Flexible(
                 f"No VNA points were found near {target_freq} GHz."
             )
 
-        # Desired-port transmission.
-        correct_dB = float(
-            np.mean(clean_traces[desired_port][i_l:i_r])
-        )
+        # ------------------------------------------------------------
+        # Desired transmission
+        # 4 GHz -> S21
+        # 6 GHz -> S31
+        # ------------------------------------------------------------
 
-        # ============================================================
-        # PRIMARY DEMUX METRIC
-        # Compare desired port against the other target port(s).
-        # For our case:
-        #   4 GHz -> S21 - S31
-        #   6 GHz -> S31 - S21
-        # ============================================================
-
-        competing_power = np.zeros_like(freq, dtype=float)
-
-        for port in target_port_set:
-            if port != desired_port:
-                competing_power += T[port]
-
-        competing_dB = 10.0 * np.log10(
-            competing_power + 1e-300
-        )
-
-        pairwise_sep_dB = float(
+        correct_power = float(
             np.mean(
-                clean_traces[desired_port][i_l:i_r]
-                - competing_dB[i_l:i_r]
+                T[desired_port][i_l:i_r]
             )
         )
 
-        # ============================================================
-        # SECONDARY LEAKAGE METRIC
-        # Look only at ports that are NOT target demux ports.
-        # For S21/S31 demux this means S41, S51, S61.
-        # ============================================================
+        # ------------------------------------------------------------
+        # Wrong target port
+        #
+        # 4 GHz desired S21 -> wrong target S31
+        # 6 GHz desired S31 -> wrong target S21
+        # ------------------------------------------------------------
 
-        extra_power = np.zeros_like(freq, dtype=float)
+        wrong_target_power = np.zeros_like(
+            freq,
+            dtype=float
+        )
+
+        for port in target_port_set:
+            if port == desired_port:
+                continue
+
+            wrong_target_power += T[port]
+
+        wrong_power = float(
+            np.mean(
+                wrong_target_power[i_l:i_r]
+            )
+        )
+
+        # ------------------------------------------------------------
+        # Extra leakage
+        # For S21/S31 demux: S41, S51, S61
+        # ------------------------------------------------------------
+
+        extra_power = np.zeros_like(
+            freq,
+            dtype=float
+        )
 
         for port in port_labels:
             if port in target_port_set:
@@ -347,82 +607,133 @@ def Demult_Obj_dB_Flexible(
 
             extra_power += weight * T[port]
 
-        if np.all(extra_power == 0.0):
-            extra_sep_dB = 0.0
-        else:
-            extra_dB = 10.0 * np.log10(
-                extra_power + 1e-300
+        extra_leakage = float(
+            np.mean(
+                extra_power[i_l:i_r]
             )
+        )
 
-            extra_sep_dB = float(
-                np.mean(
-                    clean_traces[desired_port][i_l:i_r]
-                    - extra_dB[i_l:i_r]
-                )
+        correct_metrics.append(correct_power)
+        wrong_metrics.append(wrong_power)
+        extra_metrics.append(extra_leakage)
+
+        pairwise_sep_dB.append(
+            10.0 * np.log10(
+                (correct_power + 1e-300)
+                / (wrong_power + 1e-300)
             )
-
-        correct_metrics.append(correct_dB)
-        pairwise_metrics.append(pairwise_sep_dB)
-        extra_leakage_metrics.append(extra_sep_dB)
-
-    current_metrics = correct_metrics + pairwise_metrics
-
-    if len(norms) == 0:
-        return 0.0, current_metrics
-
-    if len(norms) != len(current_metrics):
-        raise ValueError(
-            "Norms length does not match the current demux target setup. "
-            "Use a new ID after changing the objective."
         )
 
     # ================================================================
-    # SCORE
-    #
-    # The worse target frequency matters most, so BOTH frequencies
-    # must demultiplex correctly.
+    # NORMALIZATION
+    # Save the starting desired-port powers.
     # ================================================================
 
-    worst_pairwise = float(np.min(pairwise_metrics))
-    mean_pairwise = float(np.mean(pairwise_metrics))
+    if len(norms) == 0:
+        new_norms = [
+            max(float(value), 1e-300)
+            for value in correct_metrics
+        ]
 
-    pairwise_score = (
-        0.7 * worst_pairwise
-        + 0.3 * mean_pairwise
+        return 0.0, new_norms
+
+    if len(norms) != len(clean_targets):
+        raise ValueError(
+            "Norms length does not match the current demux objective. "
+            "Use a new ID after changing the objective."
+        )
+
+    correct = np.asarray(correct_metrics, dtype=float)
+    extra = np.asarray(extra_metrics, dtype=float)
+    baseline_correct = np.asarray(norms, dtype=float)
+    pair_sep = np.asarray(pairwise_sep_dB, dtype=float)
+
+    # ================================================================
+    # 1. ROUTING QUALITY
+    #
+    # Smooth bounded reward for actual demultiplexing.
+    #
+    # ~0 dB separation  -> very small reward
+    # 10 dB separation  -> 0.5
+    # 20 dB separation  -> near 1
+    # ================================================================
+
+    sep_target_dB = 10.0
+    sep_softness_dB = 3.0
+
+    z = np.clip(
+        (pair_sep - sep_target_dB) / sep_softness_dB,
+        -60.0,
+        60.0
     )
 
-    # Small reward for keeping the weaker desired transmission useful.
-    worst_correct_dB = float(np.min(correct_metrics))
-
-    transmission_score = 0.1 * (
-        np.clip(worst_correct_dB, -80.0, 0.0) + 80.0
+    routing_quality = 1.0 / (
+        1.0 + np.exp(-z)
     )
 
-    # Extra ports are only a secondary penalty.
-    # They cannot earn extra reward for beating down S41/S51/S61.
-    mean_extra_sep = float(np.mean(extra_leakage_metrics))
+    # ================================================================
+    # 2. TRANSMISSION QUALITY
+    #
+    # Reward stronger desired-port transmission, but bound it at 1
+    # so one frequency cannot dominate the objective.
+    #
+    # Starting transmission -> 0.5
+    # Better than start      -> approaches 1
+    # Worse than start       -> approaches 0
+    # ================================================================
 
-    extra_leakage_penalty = max(
-        0.0,
-        -mean_extra_sep
+    transmission_quality = (
+        correct
+        / (correct + baseline_correct + 1e-300)
     )
 
-    objective_value = (
-        w_iso * pairwise_score
-        + w_trans * transmission_score
-        - 0.1 * extra_leakage_penalty
+    # ================================================================
+    # 3. EXTRA-PORT QUALITY
+    #
+    # S41/S51/S61 remain secondary.
+    # ================================================================
+
+    extra_quality = (
+        correct
+        / (correct + extra + 1e-300)
+    )
+
+    w_extra = 0.25
+
+    # ================================================================
+    # COMPLETE QUALITY OF EACH TARGET FREQUENCY
+    #
+    # Each frequency must have:
+    #   - correct routing
+    #   - useful transmission
+    #   - limited extra leakage
+    #
+    # Then multiply the two complete channel scores so one good
+    # frequency cannot compensate for one bad frequency.
+    # ================================================================
+
+    channel_quality = (
+        routing_quality**w_iso
+        * transmission_quality**w_trans
+        * extra_quality**w_extra
+    )
+
+    objective_value = float(
+        np.prod(channel_quality)
     )
 
     print(
         f"[Demux objective] "
-        f"trans={np.round(correct_metrics, 2)}, "
-        f"pair_sep={np.round(pairwise_metrics, 2)}, "
-        f"extra_sep={np.round(extra_leakage_metrics, 2)}, "
-        f"worst_pair={worst_pairwise:.2f} dB, "
-        f"obj={objective_value:.2f}"
+        f"pair_sep_dB={np.round(pair_sep, 2)}, "
+        f"routing_q={np.round(routing_quality, 3)}, "
+        f"trans_q={np.round(transmission_quality, 3)}, "
+        f"extra_q={np.round(extra_quality, 3)}, "
+        f"channel_q={np.round(channel_quality, 3)}, "
+        f"obj={objective_value:.5f}"
     )
 
-    return float(objective_value), norms
+    return objective_value, norms
+
 
 
 def Demult_Obj_dB_6Port(
@@ -3187,6 +3498,7 @@ class PMMInSitu:
         wrong_port_weights=None,
         plot_ports=None,
         random_state=None,
+        local_radius=0.05,
         health_log_path=None,
         active_health_every=20,
         active_health_V=20.0,
@@ -3218,6 +3530,24 @@ class PMMInSitu:
             rho,
             dtype=float
         ).ravel()
+
+        # Keep Bayesian search local to the supplied starting rho.
+        rho_center = rho.copy()
+        rho_max = self.f_a(fpm)
+
+        search_space = [
+            Real(
+                max(0.0, rho_center[i] - local_radius),
+                min(rho_max, rho_center[i] + local_radius),
+                name=f"rho_{i}"
+            )
+            for i in range(rho.size)
+        ]
+
+        print(
+            f"Local Bayesian search around starting rho "
+            f"with radius +/-{local_radius:.3f}"
+        )
 
         os.makedirs(
             progress_dir,
@@ -3521,14 +3851,7 @@ class PMMInSitu:
         result = gp_minimize(
             func=full_objective_function,
 
-            dimensions=[
-                Real(
-                    0.0,
-                    self.f_a(fpm),
-                    name=f"rho_{i}"
-                )
-                for i in range(rho.size)
-            ],
+            dimensions=search_space,
 
             x0=x0_initial,
             y0=y0_initial,
