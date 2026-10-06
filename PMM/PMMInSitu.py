@@ -1477,7 +1477,7 @@ def save_demult_progress_callback(
                     warmup=active_health_warmup,
                     cooldown=active_health_cooldown,
                     ideal_W=20.0,
-                    low_W=1.0,
+                    low_W=10.0,
                     high_W=active_health_stop_W if active_health_stop_W is not None else 50.0
                 )
 
@@ -1491,14 +1491,41 @@ def save_demult_progress_callback(
                 print(f"[WARN] Active health diagnostic failed at call {call_idx}: {exc}")
                 rows = []
 
+            low_power = [
+                row for row in rows
+                if np.isfinite(row["P_power_supply"])
+                and row["P_power_supply"] < 10.0
+            ]
+
+            if low_power:
+                print("\n!!! LOW POWER SAFETY STOP !!!")
+                for row in low_power:
+                    print(
+                        f"Bulb {row['addr']} is drawing "
+                        f"{row['P_power_supply']:.2f} W (< 10.00 W)"
+                    )
+                raise RuntimeError(
+                    "LOW POWER SAFETY STOP: one or more bulbs fell below 10 W."
+                )
+
             if active_health_stop_W is not None:
-                high_power = [row for row in rows if np.isfinite(row["P_power_supply"]) and row["P_power_supply"] > active_health_stop_W]
+                high_power = [
+                    row for row in rows
+                    if np.isfinite(row["P_power_supply"])
+                    and row["P_power_supply"] > active_health_stop_W
+                ]
 
                 if high_power:
                     print("\n!!! HIGH POWER SAFETY STOP !!!")
                     for row in high_power:
-                        print(f"Bulb {row['addr']} is drawing {row['P_power_supply']:.2f} W (> {active_health_stop_W:.2f} W)")
-                    raise RuntimeError("HIGH POWER SAFETY STOP: one or more bulbs exceeded the allowed power.")
+                        print(
+                            f"Bulb {row['addr']} is drawing "
+                            f"{row['P_power_supply']:.2f} W "
+                            f"(> {active_health_stop_W:.2f} W)"
+                        )
+                    raise RuntimeError(
+                        "HIGH POWER SAFETY STOP: one or more bulbs exceeded the allowed power."
+                    )
 
     return _callback
 
@@ -3848,31 +3875,54 @@ class PMMInSitu:
         # Bayesian optimization
         # ================================================================
 
-        result = gp_minimize(
-            func=full_objective_function,
+        # result = gp_minimize(
+        #     func=full_objective_function,
 
-            dimensions=search_space,
+        #     dimensions=search_space,
 
-            x0=x0_initial,
-            y0=y0_initial,
+        #     x0=x0_initial,
+        #     y0=y0_initial,
 
-            n_calls=n_calls_remaining,
+        #     n_calls=n_calls_remaining,
 
-            n_initial_points=max(
-                0,
-                n_initial_points
-                - (
-                    len(x0_initial)
-                    if is_warm_start
-                    else 0
-                )
-            ),
+        #     n_initial_points=max(
+        #         0,
+        #         n_initial_points
+        #         - (
+        #             len(x0_initial)
+        #             if is_warm_start
+        #             else 0
+        #         )
+        #     ),
 
-            noise="gaussian",
-            acq_func="EI",
-            callback=callback_handler,
-            random_state=random_state
-        )
+        #     noise="gaussian",
+        #     acq_func="EI",
+        #     callback=callback_handler,
+        #     random_state=random_state
+        # )
+        try:
+            result = gp_minimize(
+                func=full_objective_function,
+                dimensions=search_space,
+                x0=x0_initial,
+                y0=y0_initial,
+                n_calls=n_calls_remaining,
+                n_initial_points=max(
+                    0,
+                    n_initial_points
+                    - (len(x0_initial) if is_warm_start else 0)
+                ),
+                noise="gaussian",
+                acq_func="EI",
+                callback=callback_handler,
+                random_state=random_state
+            )
+
+        except RuntimeError as exc:
+            if "POWER SAFETY STOP" in str(exc):
+                print(f"\nBayesian optimization stopped: {exc}")
+                return None
+            raise
 
         # ================================================================
         # Find and measure the best result
