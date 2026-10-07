@@ -3109,8 +3109,8 @@ class PMMInSitu:
             V = BulbSet[addr - 1, 0]
             I = BulbSet[addr - 1, 1]
 
-    if V == 0.0 and I == 0.0:
-        self.Deactivate_Bulb(addr)
+        if V == 0.0 and I == 0.0:
+            self.Deactivate_Bulb(addr)
 
         return
 
