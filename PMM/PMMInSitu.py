@@ -2930,8 +2930,9 @@ class PMMInSitu:
         # -----------------------------
         # piecewise mapping
         # -----------------------------
-        if fp <= fp_min:
-            return (V_fixed_current, I_min)
+        
+        if fp < fp_min:
+            return (0.0, 0.0)  # OFF
 
         elif fp < fp_switch:
             I = invert_current(fp)
@@ -3102,6 +3103,14 @@ class PMMInSitu:
 
         for thread in threads:
             thread.join()
+
+        # Truly turn off bulbs whose mapped state is OFF.
+        for addr in range(1, BulbSet.shape[0] + 1):
+            V = BulbSet[addr - 1, 0]
+            I = BulbSet[addr - 1, 1]
+
+    if V == 0.0 and I == 0.0:
+        self.Deactivate_Bulb(addr)
 
         return
 
