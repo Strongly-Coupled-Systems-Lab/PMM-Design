@@ -1675,6 +1675,7 @@ class PMMInSitu:
                 self.bulbs[bulb_addr]['Inst'].serial.timeout = 1
                 self.bulbs[bulb_addr]['Inst'].serial.close_port_after_each_call = True
                 self.bulbs[bulb_addr]['Inst'].serial.clear_buffers_before_each_transaction = True
+                
 
         # Now ping each of the power supplies in parallel.
         self.parallel_bulb_op('_parallel_check_bulb')
@@ -2455,24 +2456,60 @@ class PMMInSitu:
         return
 
 
-    def Config_Warmup(self, T = 10, ballasts = 'New', duty_cycle = 0.5):
+    # def Config_Warmup(self, T = 10, ballasts = 'New', duty_cycle = 0.5):
+    #     """
+    #     Runs the standard warm-up procedure for the bulb array
+    #     """
+    #     if ballasts == 'New':
+    #         activate = 20
+    #     else:
+    #         activate = 12
+    #     for i in range(T):
+    #         print("Warmup cycle", i+1)
+    #         self.Set_Bulb_VI('all', activate, 10, verbose = False)
+    #         time.sleep(0.5)
+    #         self.Activate_Bulb('all')
+    #         time.sleep(4)
+    #         self.Set_Bulb_VI('all', activate-4, 10, verbose = False)
+    #         time.sleep(10)
+    #         self.Deactivate_Bulb('all')
+    #         time.sleep(15/duty_cycle-15)
+
+    #     return
+    def Config_Warmup(self, T=10, ballasts='New', duty_cycle=0.5):
         """
-        Runs the standard warm-up procedure for the bulb array
+        Runs the standard warm-up procedure for the bulb array.
+        Always attempts to deactivate the array before exiting.
         """
         if ballasts == 'New':
             activate = 20
         else:
             activate = 12
-        for i in range(T):
-            print("Warmup cycle", i+1)
-            self.Set_Bulb_VI('all', activate, 10, verbose = False)
-            time.sleep(0.5)
-            self.Activate_Bulb('all')
-            time.sleep(4)
-            self.Set_Bulb_VI('all', activate-4, 10, verbose = False)
-            time.sleep(10)
-            self.Deactivate_Bulb('all')
-            time.sleep(15/duty_cycle-15)
+
+        try:
+            for i in range(T):
+                print("Warmup cycle", i+1)
+
+                self.Set_Bulb_VI('all', activate, 10, verbose=False)
+                time.sleep(0.5)
+
+                self.Activate_Bulb('all')
+                time.sleep(4)
+
+                self.Set_Bulb_VI('all', activate-4, 10, verbose=False)
+                time.sleep(10)
+
+                self.Deactivate_Bulb('all')
+                time.sleep(15/duty_cycle-15)
+
+        finally:
+            print("Ensuring array is OFF...")
+            try:
+                self.Deactivate_Bulb('all')
+                time.sleep(1)
+                self.Deactivate_Bulb('all')
+            except Exception as exc:
+                print(f"[WARN] Could not confirm shutdown command: {exc}")
 
         return
 
@@ -3982,6 +4019,886 @@ class PMMInSitu:
             ),
             all_objs_achieved,
             show=show
+        )
+
+        return result
+
+    def optimize_demult_turbo_bayes(
+        self,
+        n_total_calls,
+        rho,
+        fpm,
+        k,
+        S,
+        f1,
+        f2,
+        df=0.5,
+        n_initial_points=20,
+        objective="dB_6port",
+        wu=10,
+        progress_dir=".",
+        fwin=None,
+        duty_cycle=0.5,
+        show=True,
+        show_each_call=False,
+        ID="",
+        w_trans=0.25,
+        w_iso=1.0,
+        target_ports=None,
+        wrong_port_weights=None,
+        plot_ports=None,
+        random_state=None,
+        local_radius=None,
+        health_log_path=None,
+        active_health_every=20,
+        active_health_V=20.0,
+        active_health_I=3.0,
+        active_health_warmup=5.0,
+        active_health_cooldown=3.0,
+        active_health_stop_W=None,
+        active_health_log_path=None,
+        health_monitor_interval=1.0,
+        turbo_length_init=0.8,
+        turbo_length_min=0.5**7,
+        turbo_length_max=1.6,
+        turbo_success_tolerance=3,
+        turbo_failure_tolerance=20,
+        turbo_n_candidates=2000,
+        turbo_max_gp_points=300,
+        turbo_noise_success_mult=1.0,
+    ):
+        """
+        TuRBO-1 optimization for the six-port demultiplexer.
+
+        Uses the same experimental objective, logging, spectra, health
+        checks, warmup, and hardware functions as optimize_demult_bayes(),
+        but uses an adaptive TuRBO trust region with Thompson sampling.
+        """
+
+        from types import SimpleNamespace
+
+        import torch
+        import gpytorch
+        from botorch.fit import fit_gpytorch_mll
+        from botorch.generation import MaxPosteriorSampling
+        from botorch.models import SingleTaskGP
+        from gpytorch.kernels import MaternKernel, ScaleKernel
+        from gpytorch.mlls import ExactMarginalLogLikelihood
+        from torch.quasirandom import SobolEngine
+
+        if fwin is None:
+            fwin = []
+
+        if target_ports is None:
+            target_ports = ["S21", "S31"]
+
+        rho = np.asarray(rho, dtype=float).ravel()
+        dim = rho.size
+
+        # ================================================================
+        # OUTER LOCAL SEARCH BOX
+        # Same idea as optimize_demult_bayes().
+        # TuRBO moves a smaller adaptive trust region inside this box.
+        # ================================================================
+
+        rho_center = rho.copy()
+        rho_max = self.f_a(fpm)
+
+        if local_radius is None:
+            lower = np.zeros_like(rho_center)
+            upper = np.full_like(rho_center, rho_max)
+            print(f"TuRBO global search over full rho range: 0 to {rho_max:.6g}")
+
+        else:
+            lower = np.maximum(0.0, rho_center - local_radius)
+            upper = np.minimum(rho_max, rho_center + local_radius)
+            print(f"TuRBO local search around starting rho with radius +/-{local_radius:.3f}")
+
+        span = upper - lower
+
+        if np.any(span <= 0):
+            raise ValueError("One or more TuRBO search dimensions have zero width.")
+
+        # ================================================================
+        # FILES
+        # ================================================================
+
+        os.makedirs(progress_dir, exist_ok=True)
+
+        rho_path = os.path.join(
+            progress_dir,
+            (
+                f"rho_Demult_{f1:.1f}_{f2:.1f}GHz_"
+                f"fpm_{fpm:.1f}GHz{ID}.csv"
+            )
+        )
+
+        obj_path = os.path.join(
+            progress_dir,
+            (
+                f"obj_Demult_{f1:.1f}_{f2:.1f}GHz_"
+                f"fpm_{fpm:.1f}GHz{ID}.csv"
+            )
+        )
+
+        nrm_path = os.path.join(
+            progress_dir,
+            (
+                f"norms_Demult_{f1:.1f}_{f2:.1f}GHz_"
+                f"fpm_{fpm:.1f}GHz{ID}.csv"
+            )
+        )
+
+        if (
+            active_health_log_path is None
+            and active_health_every is not None
+            and active_health_every > 0
+        ):
+            active_health_log_path = os.path.join(
+                progress_dir,
+                (
+                    f"active_health_Demult_{f1:.1f}_{f2:.1f}GHz_"
+                    f"fpm_{fpm:.1f}GHz{ID}.csv"
+                )
+            )
+
+        active_health_plot_path = None
+
+        if active_health_log_path is not None:
+            active_health_plot_path = (
+                active_health_log_path.replace(
+                    ".csv",
+                    ".pdf"
+                )
+            )
+
+        # ================================================================
+        # LOAD EXISTING SAME-ID DATA OR START FRESH
+        # ================================================================
+
+        X_phys = []
+        Y = []
+
+        if (
+            os.path.isfile(rho_path)
+            and os.path.isfile(obj_path)
+            and os.path.getsize(rho_path) > 0
+            and os.path.getsize(obj_path) > 0
+        ):
+            loaded_rhos = np.atleast_2d(
+                np.loadtxt(
+                    rho_path,
+                    delimiter=","
+                )
+            )
+
+            loaded_objs = np.atleast_1d(
+                np.loadtxt(
+                    obj_path,
+                    delimiter=","
+                )
+            ).astype(float).ravel()
+
+            if loaded_rhos.shape[0] != loaded_objs.shape[0]:
+                raise ValueError(
+                    "TuRBO warm-start rho/objective logs do not match."
+                )
+
+            if loaded_rhos.shape[1] != dim:
+                raise ValueError(
+                    "TuRBO warm-start rho length does not match array."
+                )
+
+            X_phys = [
+                x.copy()
+                for x in loaded_rhos
+            ]
+
+            Y = loaded_objs.tolist()
+
+            print(
+                f"Loaded {len(Y)} existing TuRBO evaluations."
+            )
+
+            if len(Y) >= n_total_calls:
+                print("Requested TuRBO run is already complete.")
+                return None
+
+        else:
+            print("Starting fresh TuRBO run.")
+
+            open(rho_path, "w").close()
+            open(obj_path, "w").close()
+
+        # ================================================================
+        # WARMUP
+        # ================================================================
+
+        if wu > 0:
+            self.Config_Warmup(
+                T=wu,
+                ballasts="New",
+                duty_cycle=duty_cycle
+            )
+
+        # ================================================================
+        # OBJECTIVE NORMALIZATION
+        # Same normalization used by your existing Bayes function.
+        # ================================================================
+
+        if os.path.isfile(nrm_path):
+
+            norms = np.atleast_1d(
+                np.loadtxt(
+                    nrm_path,
+                    delimiter=","
+                )
+            ).astype(float).tolist()
+
+        else:
+
+            print(
+                "Measuring starting state for "
+                "demultiplexer normalization..."
+            )
+
+            _, norms = self.Demult_Obj_Get_6Port(
+                rho,
+                fpm,
+                k,
+                S,
+                f1,
+                f2,
+                df=df,
+                objective=objective,
+                norms=[],
+                duty_cycle=duty_cycle,
+                w_trans=w_trans,
+                w_iso=w_iso,
+                target_ports=target_ports,
+                wrong_port_weights=wrong_port_weights,
+                health_log_path=health_log_path,
+                health_monitor_interval=health_monitor_interval
+            )
+
+            np.savetxt(
+                nrm_path,
+                np.asarray(norms),
+                delimiter=","
+            )
+
+        # ================================================================
+        # REUSE YOUR EXISTING CALLBACK
+        # This preserves the existing rho/obj/spectrum/health logging.
+        # ================================================================
+
+        callback_handler = save_demult_progress_callback(
+            rho_path,
+            obj_path,
+            self,
+            fpm,
+            k,
+            S,
+            f1,
+            f2,
+            fwin,
+            progress_dir,
+            show_each_call=show_each_call,
+            plot_ports=plot_ports,
+            active_health_every=active_health_every,
+            active_health_log_path=active_health_log_path,
+            active_health_plot_path=active_health_plot_path,
+            active_health_V=active_health_V,
+            active_health_I=active_health_I,
+            active_health_warmup=active_health_warmup,
+            active_health_cooldown=active_health_cooldown,
+            active_health_stop_W=active_health_stop_W
+        )
+
+        # ================================================================
+        # ONE PHYSICAL EVALUATION
+        # ================================================================
+
+        def evaluate(rho_candidate):
+
+            value, _ = self.Demult_Obj_Get_6Port(
+                np.asarray(
+                    rho_candidate,
+                    dtype=float
+                ),
+                fpm,
+                k,
+                S,
+                f1,
+                f2,
+                df=df,
+                objective=objective,
+                norms=norms,
+                duty_cycle=duty_cycle,
+                w_trans=w_trans,
+                w_iso=w_iso,
+                target_ports=target_ports,
+                wrong_port_weights=wrong_port_weights,
+                health_log_path=health_log_path,
+                health_monitor_interval=health_monitor_interval
+            )
+
+            value = float(value)
+
+            # Make a tiny fake skopt-style result so your existing callback
+            # can be reused unchanged.
+            fake_result = SimpleNamespace(
+                x_iters=[
+                    np.asarray(
+                        rho_candidate
+                    ).tolist()
+                ],
+                func_vals=np.asarray(
+                    [-value]
+                )
+            )
+
+            callback_handler(
+                fake_result
+            )
+
+            return value
+
+        # ================================================================
+        # TuRBO SETTINGS
+        # ================================================================
+
+        length = float(turbo_length_init)
+
+        success_counter = 0
+        failure_counter = 0
+
+        seed = (
+            0
+            if random_state is None
+            else int(random_state)
+        )
+
+        torch.manual_seed(seed)
+
+        device = torch.device("cpu")
+        dtype = torch.double
+
+        try:
+
+            # ============================================================
+            # INITIAL DESIGN
+            # ============================================================
+
+            if len(Y) == 0:
+
+                y0 = evaluate(
+                    rho_center
+                )
+
+                X_phys.append(
+                    rho_center.copy()
+                )
+
+                Y.append(
+                    y0
+                )
+
+            n_init_target = min(
+                n_initial_points,
+                n_total_calls
+            )
+
+            if len(Y) < n_init_target:
+
+                sobol = SobolEngine(
+                    dimension=dim,
+                    scramble=True,
+                    seed=seed
+                )
+
+                X_initial = sobol.draw(
+                    n_init_target - len(Y)
+                ).cpu().numpy()
+
+                for x_unit in X_initial:
+
+                    x_phys = from_unit(
+                        x_unit
+                    )
+
+                    y_next = evaluate(
+                        x_phys
+                    )
+
+                    X_phys.append(
+                        x_phys.copy()
+                    )
+
+                    Y.append(
+                        y_next
+                    )
+
+            # ============================================================
+            # TuRBO LOOP
+            # ============================================================
+
+            while len(Y) < n_total_calls:
+
+                X_unit = np.vstack(
+                    [
+                        to_unit(x)
+                        for x in X_phys
+                    ]
+                )
+
+                Y_array = np.asarray(
+                    Y,
+                    dtype=float
+                )
+
+                best_idx = int(
+                    np.argmax(Y_array)
+                )
+
+                best_value = float(
+                    Y_array[best_idx]
+                )
+
+                x_center = X_unit[
+                    best_idx
+                ]
+
+                # Fit only points nearest the current best once history
+                # gets large.
+                if (
+                    turbo_max_gp_points is not None
+                    and len(Y_array) > turbo_max_gp_points
+                ):
+
+                    distance = np.sum(
+                        (
+                            X_unit
+                            - x_center[None, :]
+                        )**2,
+                        axis=1
+                    )
+
+                    keep = np.argsort(
+                        distance
+                    )[:turbo_max_gp_points]
+
+                    X_fit = X_unit[
+                        keep
+                    ]
+
+                    Y_fit = Y_array[
+                        keep
+                    ]
+
+                else:
+
+                    X_fit = X_unit
+                    Y_fit = Y_array
+
+                # Standardize objective values before fitting the GP.
+                y_mean = np.mean(
+                    Y_fit
+                )
+
+                y_std = np.std(
+                    Y_fit
+                )
+
+                if y_std < 1e-12:
+                    y_std = 1.0
+
+                Y_standard = (
+                    Y_fit - y_mean
+                ) / y_std
+
+                train_X = torch.tensor(
+                    X_fit,
+                    dtype=dtype,
+                    device=device
+                )
+
+                train_Y = torch.tensor(
+                    Y_standard[:, None],
+                    dtype=dtype,
+                    device=device
+                )
+
+                # ARD Matern GP.
+                # SingleTaskGP learns observation noise from the data.
+                model = SingleTaskGP(
+                    train_X,
+                    train_Y,
+                    covar_module=ScaleKernel(
+                        MaternKernel(
+                            nu=2.5,
+                            ard_num_dims=dim
+                        )
+                    )
+                )
+
+                mll = ExactMarginalLogLikelihood(
+                    model.likelihood,
+                    model
+                )
+
+                with gpytorch.settings.cholesky_jitter(
+                    1e-5
+                ):
+                    fit_gpytorch_mll(
+                        mll
+                    )
+
+                # --------------------------------------------------------
+                # Lengthscale-shaped TuRBO trust region
+                # --------------------------------------------------------
+
+                weights = (
+                    model
+                    .covar_module
+                    .base_kernel
+                    .lengthscale
+                    .detach()
+                    .view(-1)
+                )
+
+                weights = torch.clamp(
+                    weights,
+                    min=1e-6
+                )
+
+                weights = (
+                    weights
+                    / weights.mean()
+                )
+
+                weights = (
+                    weights
+                    / torch.prod(
+                        weights.pow(
+                            1.0 / dim
+                        )
+                    )
+                )
+
+                center_t = torch.tensor(
+                    x_center,
+                    dtype=dtype,
+                    device=device
+                )
+
+                tr_lb = torch.clamp(
+                    center_t
+                    - weights * length / 2.0,
+                    0.0,
+                    1.0
+                )
+
+                tr_ub = torch.clamp(
+                    center_t
+                    + weights * length / 2.0,
+                    0.0,
+                    1.0
+                )
+
+                # --------------------------------------------------------
+                # Generate TuRBO Thompson-sampling candidates
+                # --------------------------------------------------------
+
+                sobol = SobolEngine(
+                    dimension=dim,
+                    scramble=True,
+                    seed=seed + len(Y)
+                )
+
+                perturbations = sobol.draw(
+                    turbo_n_candidates
+                ).to(
+                    dtype=dtype,
+                    device=device
+                )
+
+                perturbations = (
+                    tr_lb
+                    + (
+                        tr_ub
+                        - tr_lb
+                    )
+                    * perturbations
+                )
+
+                # Standard TuRBO sparse perturbation.
+                # In 91 dimensions this changes ~20 dimensions/candidate.
+                probability = min(
+                    20.0 / dim,
+                    1.0
+                )
+
+                mask = (
+                    torch.rand(
+                        turbo_n_candidates,
+                        dim,
+                        dtype=dtype,
+                        device=device
+                    )
+                    <= probability
+                )
+
+                empty_rows = torch.where(
+                    mask.sum(
+                        dim=1
+                    ) == 0
+                )[0]
+
+                if len(empty_rows) > 0:
+
+                    random_dimensions = torch.randint(
+                        0,
+                        dim,
+                        size=(len(empty_rows),),
+                        device=device
+                    )
+
+                    mask[
+                        empty_rows,
+                        random_dimensions
+                    ] = True
+
+                X_candidates = center_t.expand(
+                    turbo_n_candidates,
+                    dim
+                ).clone()
+
+                X_candidates[
+                    mask
+                ] = perturbations[
+                    mask
+                ]
+
+                sampler = MaxPosteriorSampling(
+                    model=model,
+                    replacement=False
+                )
+
+                with torch.no_grad():
+
+                    X_next = sampler(
+                        X_candidates,
+                        num_samples=1
+                    )[0]
+
+                x_next_unit = (
+                    X_next
+                    .cpu()
+                    .numpy()
+                )
+
+                x_next_phys = from_unit(
+                    x_next_unit
+                )
+
+                # Estimate objective noise in the original objective units.
+                try:
+
+                    gp_noise = float(
+                        model
+                        .likelihood
+                        .noise
+                        .detach()
+                        .mean()
+                        .cpu()
+                    )
+
+                    estimated_noise = (
+                        np.sqrt(
+                            max(
+                                gp_noise,
+                                0.0
+                            )
+                        )
+                        * y_std
+                    )
+
+                except Exception:
+
+                    estimated_noise = 0.0
+
+                # --------------------------------------------------------
+                # PHYSICAL EXPERIMENT
+                # --------------------------------------------------------
+
+                y_next = evaluate(
+                    x_next_phys
+                )
+
+                X_phys.append(
+                    x_next_phys.copy()
+                )
+
+                Y.append(
+                    y_next
+                )
+
+                # --------------------------------------------------------
+                # UPDATE TRUST REGION
+                # --------------------------------------------------------
+
+                improvement_needed = max(
+                    1e-3
+                    * max(
+                        1.0,
+                        abs(best_value)
+                    ),
+                    turbo_noise_success_mult
+                    * estimated_noise
+                )
+
+                if (
+                    y_next
+                    > best_value
+                    + improvement_needed
+                ):
+
+                    success_counter += 1
+                    failure_counter = 0
+
+                else:
+
+                    success_counter = 0
+                    failure_counter += 1
+
+                if (
+                    success_counter
+                    >= turbo_success_tolerance
+                ):
+
+                    length = min(
+                        2.0 * length,
+                        turbo_length_max
+                    )
+
+                    success_counter = 0
+
+                    print(
+                        f"[TuRBO] Expanded trust region "
+                        f"to {length:.5f}"
+                    )
+
+                elif (
+                    failure_counter
+                    >= turbo_failure_tolerance
+                ):
+
+                    length = (
+                        length / 2.0
+                    )
+
+                    failure_counter = 0
+
+                    print(
+                        f"[TuRBO] Shrunk trust region "
+                        f"to {length:.5f}"
+                    )
+
+                print(
+                    f"[TuRBO] call {len(Y)}/{n_total_calls} | "
+                    f"new={y_next:.6g} | "
+                    f"best={max(Y):.6g} | "
+                    f"length={length:.5f} | "
+                    f"noise~{estimated_noise:.3g}"
+                )
+
+                # Restart the trust-region size around the best point
+                # rather than ending the physical experiment early.
+                if length < turbo_length_min:
+
+                    print(
+                        "[TuRBO] Minimum trust-region size reached. "
+                        "Restarting trust-region size around best point."
+                    )
+
+                    length = turbo_length_init
+                    success_counter = 0
+                    failure_counter = 0
+
+        except RuntimeError as exc:
+
+            if "POWER SAFETY STOP" in str(exc):
+
+                print(
+                    f"\nTuRBO optimization stopped: {exc}"
+                )
+
+                return None
+
+            raise
+
+        # ================================================================
+        # FINAL BEST RESULT
+        # ================================================================
+
+        X_array = np.asarray(
+            X_phys
+        )
+
+        Y_array = np.asarray(
+            Y
+        )
+
+        best_idx = int(
+            np.argmax(Y_array)
+        )
+
+        best_rho = X_array[
+            best_idx
+        ]
+
+        best_obj = Y_array[
+            best_idx
+        ]
+
+        print(
+            "\nTuRBO optimization complete. "
+            f"Best objective: {best_obj:.6g}"
+        )
+
+        self.Demult_Run_And_Plot_6Port(
+            progress_dir,
+            best_rho,
+            fpm,
+            k,
+            S,
+            f1,
+            f2,
+            fwin=fwin,
+            show=show,
+            plot_ports=plot_ports
+        )
+
+        self.Plot_Obj(
+            obj_path.replace(
+                ".csv",
+                ".pdf"
+            ),
+            Y_array,
+            show=show
+        )
+
+        result = SimpleNamespace(
+            x_iters=[
+                x.tolist()
+                for x in X_array
+            ],
+            func_vals=-Y_array,
+            x=best_rho.tolist(),
+            fun=-float(best_obj),
+            best_objective=float(best_obj),
+            turbo_length=float(length)
         )
 
         return result
